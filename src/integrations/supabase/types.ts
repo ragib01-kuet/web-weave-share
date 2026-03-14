@@ -14,7 +14,80 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      peers: {
+        Row: {
+          connected_at: string
+          disconnected_at: string | null
+          id: string
+          ip_address: string | null
+          is_connected: boolean
+          peer_id: string
+          session_id: string
+          total_data_bytes: number
+        }
+        Insert: {
+          connected_at?: string
+          disconnected_at?: string | null
+          id?: string
+          ip_address?: string | null
+          is_connected?: boolean
+          peer_id: string
+          session_id: string
+          total_data_bytes?: number
+        }
+        Update: {
+          connected_at?: string
+          disconnected_at?: string | null
+          id?: string
+          ip_address?: string | null
+          is_connected?: boolean
+          peer_id?: string
+          session_id?: string
+          total_data_bytes?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "peers_session_id_fkey"
+            columns: ["session_id"]
+            isOneToOne: false
+            referencedRelation: "sessions"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      sessions: {
+        Row: {
+          bandwidth_cap: number
+          created_at: string
+          host_id: string
+          id: string
+          is_active: boolean
+          max_peers: number
+          session_code: string
+          updated_at: string
+        }
+        Insert: {
+          bandwidth_cap?: number
+          created_at?: string
+          host_id: string
+          id?: string
+          is_active?: boolean
+          max_peers?: number
+          session_code: string
+          updated_at?: string
+        }
+        Update: {
+          bandwidth_cap?: number
+          created_at?: string
+          host_id?: string
+          id?: string
+          is_active?: boolean
+          max_peers?: number
+          session_code?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
