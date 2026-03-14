@@ -1,0 +1,13 @@
+Aether**Grid** — Decentralized mesh internet sharing platform.
+- Colors: Deep navy bg (225 15% 5%), Cyan primary (195 100% 50%), Green accent (160 70% 45%), Relay purple (280 70% 60%), Warning amber (40 90% 55%)
+- Fonts: Space Grotesk (display/headings), IBM Plex Sans (body), Geist Mono (code)
+- Motion: spring stiffness 200-300, 2s pulse-glow, 3s float animation
+- Radius: 6px (rounded-md), grid background pattern
+- Dark mode only, text-gradient for branding, signal-glow and mesh-glow utilities
+- Node types: Gateway (cyan), Relay (purple), Client (green) — shown with NodeTypeBadge component
+- NetworkTopology component: concentric circle layout, animated dash links
+- WebRTC signaling via Supabase Realtime Broadcast
+- TURN servers: free openrelay.metered.ca fallback
+- Edge functions: proxy-fetch (URL proxy), get-ice-servers (TURN credentials)
+- No auth required - anonymous sessions
+- Name changed from "Aether" to "AetherGrid"
