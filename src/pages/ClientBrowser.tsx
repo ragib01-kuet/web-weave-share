@@ -1,58 +1,163 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
+import { generateAnonymousId, getSession, addPeer, removePeer as dbRemovePeer, proxyFetch } from '@/lib/session-manager';
+import { SignalingService } from '@/lib/signaling';
+import { WebRTCManager, type PeerConnectionState } from '@/lib/webrtc';
 import Metric from '@/components/Metric';
 
-type ConnectionState = 'connecting' | 'handshaking' | 'connected' | 'disconnected';
+type ConnectionState = 'resolving' | 'connecting' | 'handshaking' | 'connected' | 'disconnected' | 'error';
 
 const stateLabels: Record<ConnectionState, string> = {
-  connecting: 'Resolving signaling server...',
+  resolving: 'Looking up session...',
+  connecting: 'Connecting to signaling server...',
   handshaking: 'WebRTC handshake in progress...',
-  connected: 'Tunnel active. All traffic encrypted.',
+  connected: 'Tunnel active. All traffic encrypted via WebRTC.',
   disconnected: 'Disconnected from mesh.',
+  error: 'Connection failed.',
 };
 
 const ClientBrowser = () => {
-  const { sessionId } = useParams();
+  const { sessionId: sessionCode } = useParams();
   const navigate = useNavigate();
-  const [state, setState] = useState<ConnectionState>('connecting');
+  const [clientId] = useState(generateAnonymousId);
+  const [state, setState] = useState<ConnectionState>('resolving');
+  const [errorMsg, setErrorMsg] = useState('');
   const [url, setUrl] = useState('');
   const [browsedUrl, setBrowsedUrl] = useState('');
+  const [pageContent, setPageContent] = useState('');
+  const [loading, setLoading] = useState(false);
   const [dataUsed, setDataUsed] = useState(0);
+  const [useDirectProxy, setUseDirectProxy] = useState(false);
 
-  // Simulate connection sequence
-  useEffect(() => {
-    const t1 = setTimeout(() => setState('handshaking'), 1500);
-    const t2 = setTimeout(() => setState('connected'), 3500);
-    return () => { clearTimeout(t1); clearTimeout(t2); };
+  const signalingRef = useRef<SignalingService | null>(null);
+  const webrtcRef = useRef<WebRTCManager | null>(null);
+  const sessionDbId = useRef<string | null>(null);
+
+  const onPeerUpdate = useCallback((peerMap: Map<string, PeerConnectionState>) => {
+    const connected = Array.from(peerMap.values()).some(p => p.state === 'connected');
+    if (connected) {
+      setState('connected');
+    }
   }, []);
 
-  // Simulate data usage
+  // Initialize connection
   useEffect(() => {
-    if (state !== 'connected' || !browsedUrl) return;
-    const interval = setInterval(() => {
-      setDataUsed(d => d + Math.random() * 0.5);
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [state, browsedUrl]);
+    if (!sessionCode) return;
+    let cancelled = false;
 
-  const handleNavigate = (e: React.FormEvent) => {
+    const init = async () => {
+      try {
+        // Step 1: Resolve session
+        setState('resolving');
+        const session = await getSession(sessionCode);
+        if (cancelled) return;
+        sessionDbId.current = session.id;
+
+        // Register as peer in DB
+        await addPeer(session.id, clientId);
+
+        // Step 2: Connect to signaling
+        setState('connecting');
+        const signaling = new SignalingService(sessionCode, clientId, (msg) => {
+          webrtcRef.current?.handleSignal(msg);
+        });
+        signalingRef.current = signaling;
+
+        // Step 3: Set up WebRTC (CLIENT mode)
+        const webrtc = new WebRTCManager(signaling, clientId, false, onPeerUpdate);
+        webrtcRef.current = webrtc;
+
+        signaling.connect();
+
+        // Wait for signaling to be ready, then announce
+        setTimeout(() => {
+          if (!cancelled) {
+            setState('handshaking');
+            webrtc.announceJoin();
+          }
+        }, 1000);
+
+        // Timeout: if no connection after 15s, fall back to direct proxy
+        setTimeout(() => {
+          if (!cancelled) {
+            const peers = webrtc.getPeers();
+            const connected = Array.from(peers.values()).some(p => p.state === 'connected');
+            if (!connected) {
+              console.log('[CLIENT] WebRTC timeout, falling back to direct proxy');
+              setUseDirectProxy(true);
+              setState('connected');
+            }
+          }
+        }, 15000);
+
+      } catch (err) {
+        if (!cancelled) {
+          setErrorMsg(err instanceof Error ? err.message : 'Failed to connect');
+          setState('error');
+        }
+      }
+    };
+
+    init();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionCode, clientId, onPeerUpdate]);
+
+  const handleNavigate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!url) return;
+
     let target = url;
     if (!target.startsWith('http')) target = 'https://' + target;
     setBrowsedUrl(target);
+    setLoading(true);
+    setPageContent('');
+
+    try {
+      let result;
+
+      if (useDirectProxy) {
+        // Fallback: use edge function directly
+        result = await proxyFetch(target);
+      } else {
+        // Use WebRTC data channel
+        result = await webrtcRef.current?.sendProxyRequest(target);
+      }
+
+      if (result) {
+        setPageContent(result.body);
+        setDataUsed(d => d + (result.body.length / (1024 * 1024)));
+      }
+    } catch (err) {
+      setPageContent(`<div style="color:red;padding:20px;font-family:monospace;">Error: ${err instanceof Error ? err.message : 'Failed to fetch'}</div>`);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const handleDisconnect = () => {
+  const handleDisconnect = async () => {
+    webrtcRef.current?.disconnectAll();
+    signalingRef.current?.disconnect();
+    if (sessionDbId.current) {
+      await dbRemovePeer(sessionDbId.current, clientId).catch(console.error);
+    }
     setState('disconnected');
     setTimeout(() => navigate('/'), 1500);
   };
 
   const statusColor =
     state === 'connected' ? 'bg-accent mesh-glow' :
-    state === 'disconnected' ? 'bg-destructive' :
+    state === 'disconnected' || state === 'error' ? 'bg-destructive' :
     'bg-yellow-500 animate-pulse';
+
+  const steps = [
+    { label: 'Session resolution', done: state !== 'resolving', active: state === 'resolving' },
+    { label: 'Signaling connection', done: ['handshaking', 'connected'].includes(state), active: state === 'connecting' },
+    { label: 'ICE candidate gathering', done: state === 'connected', active: state === 'handshaking' },
+    { label: 'DTLS / Data channel', done: state === 'connected', active: state === 'handshaking' },
+  ];
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -60,16 +165,15 @@ const ClientBrowser = () => {
       <header className="border-b border-border px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className={`h-2 w-2 rounded-full ${statusColor}`} />
-          <span className="text-xs font-mono tracking-tight">
-            AETHER_CLIENT
-          </span>
-          <span className="status-label ml-2">
-            Session: {sessionId}
-          </span>
+          <span className="text-xs font-mono tracking-tight">AETHER_CLIENT</span>
+          <span className="status-label ml-2">Session: {sessionCode}</span>
+          {useDirectProxy && state === 'connected' && (
+            <span className="status-label text-yellow-500 ml-2">[DIRECT PROXY MODE]</span>
+          )}
         </div>
         <div className="flex items-center gap-4">
           {state === 'connected' && (
-            <Metric label="Tunneled" value={`${dataUsed.toFixed(1)} MB`} />
+            <Metric label="Tunneled" value={`${dataUsed.toFixed(2)} MB`} />
           )}
           <button
             onClick={handleDisconnect}
@@ -88,7 +192,7 @@ const ClientBrowser = () => {
             animate={{ opacity: 1, scale: 1 }}
             className="text-center space-y-6"
           >
-            {state !== 'disconnected' && (
+            {state !== 'disconnected' && state !== 'error' && (
               <div className="flex justify-center">
                 <div className="h-16 w-16 rounded-full border-2 border-primary/30 flex items-center justify-center">
                   <div className="h-8 w-8 rounded-full bg-primary signal-glow animate-pulse-glow" />
@@ -97,30 +201,35 @@ const ClientBrowser = () => {
             )}
             <div>
               <p className="text-sm font-mono tracking-tight mb-1">
-                {state === 'connecting' && 'INITIALIZING_NODE'}
+                {state === 'resolving' && 'RESOLVING_SESSION'}
+                {state === 'connecting' && 'CONNECTING_SIGNALING'}
                 {state === 'handshaking' && 'HANDSHAKE_IN_PROGRESS'}
                 {state === 'disconnected' && 'SESSION_TERMINATED'}
+                {state === 'error' && 'CONNECTION_FAILED'}
               </p>
               <p className="status-label">{stateLabels[state]}</p>
+              {state === 'error' && <p className="text-xs text-destructive mt-2">{errorMsg}</p>}
             </div>
 
-            {state !== 'disconnected' && (
+            {!['disconnected', 'error'].includes(state) && (
               <div className="space-y-1">
-                {['STUN resolution', 'ICE candidate gathering', 'DTLS handshake', 'Service Worker proxy'].map((step, i) => {
-                  const done = state === 'handshaking' ? i < 2 : i < 4;
-                  const active = state === 'handshaking' && i === 2;
-                  return (
-                    <div key={step} className="flex items-center gap-2 justify-center">
-                      <div className={`h-1.5 w-1.5 rounded-full ${
-                        done ? 'bg-accent' : active ? 'bg-yellow-500 animate-pulse' : 'bg-muted'
-                      }`} />
-                      <span className={`text-[10px] font-mono ${done ? 'text-accent' : 'text-muted-foreground'}`}>
-                        {step}
-                      </span>
-                    </div>
-                  );
-                })}
+                {steps.map((step) => (
+                  <div key={step.label} className="flex items-center gap-2 justify-center">
+                    <div className={`h-1.5 w-1.5 rounded-full ${
+                      step.done ? 'bg-accent' : step.active ? 'bg-yellow-500 animate-pulse' : 'bg-muted'
+                    }`} />
+                    <span className={`text-[10px] font-mono ${step.done ? 'text-accent' : 'text-muted-foreground'}`}>
+                      {step.label}
+                    </span>
+                  </div>
+                ))}
               </div>
+            )}
+
+            {state === 'error' && (
+              <button onClick={() => navigate('/')} className="text-xs font-mono text-primary mechanical-press">
+                RETURN_HOME
+              </button>
             )}
           </motion.div>
         </div>
@@ -143,26 +252,27 @@ const ClientBrowser = () => {
             </div>
             <button
               type="submit"
-              className="bg-primary text-primary-foreground text-xs font-mono px-4 mechanical-press"
+              disabled={loading}
+              className="bg-primary text-primary-foreground text-xs font-mono px-4 mechanical-press disabled:opacity-50"
             >
-              GO_
+              {loading ? 'LOADING...' : 'GO_'}
             </button>
           </form>
 
           {/* Content Area */}
-          <div className="flex-1 relative">
+          <div className="flex-1 relative overflow-auto">
             {!browsedUrl ? (
               <div className="flex items-center justify-center h-full">
                 <div className="text-center space-y-4 max-w-md">
                   <h2 className="text-lg font-mono tracking-[-0.04em]">Tunnel Active</h2>
                   <p className="text-sm text-muted-foreground">
-                    Enter a URL above. All requests are encrypted and routed through the host node via WebRTC data channels.
+                    Enter a URL above. All requests are routed through the {useDirectProxy ? 'proxy server' : 'host node via WebRTC'}.
                   </p>
                   <div className="flex gap-2 justify-center flex-wrap">
                     {['example.com', 'httpbin.org/ip', 'ifconfig.me'].map(site => (
                       <button
                         key={site}
-                        onClick={() => { setUrl(site); }}
+                        onClick={() => setUrl(site)}
                         className="text-[10px] font-mono text-primary border border-primary/30 px-2 py-1 mechanical-press hover:bg-primary/10 transition-colors"
                       >
                         {site}
@@ -171,21 +281,29 @@ const ClientBrowser = () => {
                   </div>
                 </div>
               </div>
-            ) : (
-              <div className="h-full flex flex-col">
-                <div className="flex-1 flex items-center justify-center bg-surface">
-                  <div className="text-center space-y-3 p-8">
-                    <div className="skeleton-shimmer h-4 w-64 mx-auto rounded-sm" />
-                    <div className="skeleton-shimmer h-3 w-48 mx-auto rounded-sm" />
-                    <div className="skeleton-shimmer h-3 w-56 mx-auto rounded-sm" />
-                    <p className="status-label mt-6">
-                      Tunneling: {browsedUrl}
-                    </p>
-                    <p className="text-[10px] text-muted-foreground">
-                      In production, content would render here via the WebRTC proxy.
-                    </p>
-                  </div>
+            ) : loading ? (
+              <div className="flex items-center justify-center h-64">
+                <div className="text-center space-y-3">
+                  <div className="skeleton-shimmer h-4 w-64 mx-auto rounded-sm" />
+                  <div className="skeleton-shimmer h-3 w-48 mx-auto rounded-sm" />
+                  <div className="skeleton-shimmer h-3 w-56 mx-auto rounded-sm" />
+                  <p className="status-label mt-4">Tunneling: {browsedUrl}</p>
                 </div>
+              </div>
+            ) : (
+              <div className="h-full">
+                {pageContent.startsWith('<') || pageContent.startsWith('<!') ? (
+                  <iframe
+                    srcDoc={pageContent}
+                    className="w-full h-full min-h-[500px] border-0 bg-foreground/5"
+                    sandbox="allow-same-origin"
+                    title="Proxied content"
+                  />
+                ) : (
+                  <pre className="p-4 text-xs font-mono text-foreground/80 whitespace-pre-wrap break-all">
+                    {pageContent}
+                  </pre>
+                )}
               </div>
             )}
           </div>
