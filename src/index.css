@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -6,48 +6,52 @@
 
 @layer base {
   :root {
-    --background: 240 6% 6%;
-    --foreground: 0 0% 95%;
+    --background: 225 15% 5%;
+    --foreground: 210 20% 95%;
 
-    --card: 240 4% 8%;
-    --card-foreground: 0 0% 95%;
+    --card: 225 12% 8%;
+    --card-foreground: 210 20% 95%;
 
-    --popover: 240 4% 8%;
-    --popover-foreground: 0 0% 95%;
+    --popover: 225 12% 8%;
+    --popover-foreground: 210 20% 95%;
 
-    --primary: 220 80% 55%;
-    --primary-foreground: 0 0% 100%;
+    --primary: 195 100% 50%;
+    --primary-foreground: 225 15% 5%;
 
-    --secondary: 240 4% 12%;
-    --secondary-foreground: 0 0% 85%;
+    --secondary: 225 10% 12%;
+    --secondary-foreground: 210 15% 80%;
 
-    --muted: 240 4% 14%;
-    --muted-foreground: 0 0% 45%;
+    --muted: 225 10% 15%;
+    --muted-foreground: 210 10% 45%;
 
-    --accent: 150 60% 45%;
-    --accent-foreground: 0 0% 100%;
+    --accent: 160 70% 45%;
+    --accent-foreground: 225 15% 5%;
 
     --destructive: 0 70% 50%;
     --destructive-foreground: 0 0% 100%;
 
-    --border: 0 0% 100% / 0.08;
-    --input: 0 0% 100% / 0.08;
-    --ring: 220 80% 55%;
+    --border: 210 15% 20%;
+    --input: 210 15% 20%;
+    --ring: 195 100% 50%;
 
-    --radius: 2px;
+    --radius: 6px;
 
-    --sidebar-background: 240 6% 6%;
-    --sidebar-foreground: 0 0% 85%;
-    --sidebar-primary: 220 80% 55%;
-    --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 240 4% 12%;
-    --sidebar-accent-foreground: 0 0% 85%;
-    --sidebar-border: 0 0% 100% / 0.08;
-    --sidebar-ring: 220 80% 55%;
+    --sidebar-background: 225 15% 5%;
+    --sidebar-foreground: 210 15% 80%;
+    --sidebar-primary: 195 100% 50%;
+    --sidebar-primary-foreground: 225 15% 5%;
+    --sidebar-accent: 225 10% 12%;
+    --sidebar-accent-foreground: 210 15% 80%;
+    --sidebar-border: 210 15% 20%;
+    --sidebar-ring: 195 100% 50%;
 
-    --signal-glow: 0 0 15px hsl(220 80% 55% / 0.5);
-    --mesh-glow: 0 0 8px hsl(150 60% 45% / 0.6);
-    --surface: 240 4% 10%;
+    --signal-glow: 0 0 20px hsl(195 100% 50% / 0.4), 0 0 60px hsl(195 100% 50% / 0.1);
+    --mesh-glow: 0 0 12px hsl(160 70% 45% / 0.5);
+    --surface: 225 12% 10%;
+    --warning: 40 90% 55%;
+    --gateway: 195 100% 50%;
+    --relay: 280 70% 60%;
+    --client: 160 70% 45%;
   }
 }
 
@@ -63,6 +67,10 @@
 
   code, .font-mono {
     font-family: 'Geist Mono', 'SF Mono', 'Fira Code', monospace;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: 'Space Grotesk', system-ui, sans-serif;
   }
 }
 
@@ -91,11 +99,40 @@
   .mechanical-press:active {
     transform: translateY(1px);
   }
+
+  .grid-bg {
+    background-image: 
+      linear-gradient(hsl(210 15% 20% / 0.3) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(210 15% 20% / 0.3) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  .gradient-border {
+    border: 1px solid transparent;
+    background-clip: padding-box;
+    position: relative;
+  }
+
+  .gradient-border::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    background: linear-gradient(135deg, hsl(195 100% 50% / 0.3), hsl(160 70% 45% / 0.3));
+    z-index: -1;
+  }
+
+  .text-gradient {
+    background: linear-gradient(135deg, hsl(195 100% 50%), hsl(160 70% 45%));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
 }
 
 @keyframes pulse-glow {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+  0%, 100% { opacity: 1; box-shadow: var(--signal-glow); }
+  50% { opacity: 0.6; box-shadow: 0 0 5px hsl(195 100% 50% / 0.2); }
 }
 
 @keyframes skeleton-flow {
@@ -103,12 +140,29 @@
   100% { background-position: 200% 0; }
 }
 
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+
+@keyframes dash {
+  to { stroke-dashoffset: -20; }
+}
+
 .animate-pulse-glow {
   animation: pulse-glow 2s ease-in-out infinite;
 }
 
+.animate-float {
+  animation: float 3s ease-in-out infinite;
+}
+
+.animate-dash {
+  animation: dash 1s linear infinite;
+}
+
 .skeleton-shimmer {
-  background: linear-gradient(90deg, hsl(240 4% 10%) 25%, hsl(240 4% 16%) 50%, hsl(240 4% 10%) 75%);
+  background: linear-gradient(90deg, hsl(225 12% 10%) 25%, hsl(225 12% 16%) 50%, hsl(225 12% 10%) 75%);
   background-size: 200% 100%;
   animation: skeleton-flow 1.5s ease-in-out infinite;
 }
