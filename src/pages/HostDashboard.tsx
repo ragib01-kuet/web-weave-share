@@ -1,51 +1,160 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
-import { mockPeers, generateSessionId, formatDuration, formatBytes, type Peer } from '@/lib/mock-data';
+import { formatDuration, formatBytes } from '@/lib/mock-data';
+import { generateSessionCode, generateAnonymousId, createSession, endSession, addPeer, removePeer as dbRemovePeer, proxyFetch } from '@/lib/session-manager';
+import { SignalingService } from '@/lib/signaling';
+import { WebRTCManager, type PeerConnectionState } from '@/lib/webrtc';
 import PeerCard from '@/components/PeerCard';
 import Metric from '@/components/Metric';
 import LiveIndicator from '@/components/LiveIndicator';
 
+interface PeerDisplay {
+  id: string;
+  ip: string;
+  connectedAt: number;
+  downlink: number;
+  uplink: number;
+  totalData: number;
+  status: 'active' | 'idle' | 'throttled';
+  bandwidthCap: number;
+}
+
 const HostDashboard = () => {
   const navigate = useNavigate();
-  const [sessionId] = useState(generateSessionId);
-  const [peers, setPeers] = useState<Peer[]>(mockPeers);
+  const [sessionCode] = useState(generateSessionCode);
+  const [hostId] = useState(generateAnonymousId);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [peers, setPeers] = useState<PeerDisplay[]>([]);
   const [uptime, setUptime] = useState(0);
-  const [broadcasting, setBroadcasting] = useState(true);
+  const [broadcasting, setBroadcasting] = useState(false);
+  const [initializing, setInitializing] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  const sessionLink = `${window.location.origin}/client/${sessionId}`;
+  const signalingRef = useRef<SignalingService | null>(null);
+  const webrtcRef = useRef<WebRTCManager | null>(null);
+
+  const sessionLink = `${window.location.origin}/client/${sessionCode}`;
   const totalData = peers.reduce((s, p) => s + p.totalData, 0);
   const activePeers = peers.filter(p => p.status === 'active').length;
 
+  // Convert WebRTC peers to display format
+  const updatePeersFromWebRTC = useCallback((peerMap: Map<string, PeerConnectionState>) => {
+    const displayPeers: PeerDisplay[] = Array.from(peerMap.values()).map(p => ({
+      id: p.peerId,
+      ip: p.peerId.slice(0, 8) + '...',
+      connectedAt: Date.now() - 60000, // approximate
+      downlink: p.downlink,
+      uplink: p.uplink,
+      totalData: p.totalData / (1024 * 1024), // bytes to MB
+      status: p.state === 'connected' ? 'active' : 'idle',
+      bandwidthCap: 0,
+    }));
+    setPeers(displayPeers);
+  }, []);
+
+  // Handle proxy requests from clients (HOST fetches on their behalf)
+  const handleProxyRequest = useCallback(async (peerId: string, requestId: string, url: string) => {
+    try {
+      console.log(`[HOST] Proxying request ${requestId} for ${peerId}: ${url}`);
+      const result = await proxyFetch(url);
+      webrtcRef.current?.sendProxyResponse(peerId, requestId, result.body, result.status, result.contentType);
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Proxy failed';
+      webrtcRef.current?.sendProxyResponse(peerId, requestId, JSON.stringify({ error: errorMsg }), 500, 'application/json');
+    }
+  }, []);
+
+  // Initialize session
   useEffect(() => {
+    let cancelled = false;
+
+    const init = async () => {
+      try {
+        const session = await createSession(hostId, sessionCode);
+        if (cancelled) return;
+        setSessionId(session.id);
+
+        // Set up signaling
+        const signaling = new SignalingService(sessionCode, hostId, (msg) => {
+          webrtcRef.current?.handleSignal(msg);
+
+          // Track peer in DB when they join
+          if (msg.type === 'peer-joined') {
+            addPeer(session.id, msg.from).catch(console.error);
+          }
+        });
+        signalingRef.current = signaling;
+
+        // Set up WebRTC manager (HOST mode)
+        const webrtc = new WebRTCManager(signaling, hostId, true, updatePeersFromWebRTC, handleProxyRequest);
+        webrtcRef.current = webrtc;
+
+        signaling.connect();
+        setBroadcasting(true);
+        setInitializing(false);
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Failed to initialize');
+          setInitializing(false);
+        }
+      }
+    };
+
+    init();
+    return () => { cancelled = true; };
+  }, [hostId, sessionCode, updatePeersFromWebRTC, handleProxyRequest]);
+
+  // Uptime counter
+  useEffect(() => {
+    if (!broadcasting) return;
     const interval = setInterval(() => setUptime(t => t + 1), 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [broadcasting]);
 
-  // Simulate fluctuating bandwidth
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setPeers(prev =>
-        prev.map(p => ({
-          ...p,
-          downlink: Math.max(0, p.downlink + (Math.random() - 0.5) * 0.4),
-          uplink: Math.max(0, p.uplink + (Math.random() - 0.5) * 0.1),
-          totalData: p.totalData + p.downlink * 0.1,
-        }))
-      );
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
+  const handleTerminate = useCallback((peerId: string) => {
+    webrtcRef.current?.terminatePeer(peerId);
+    if (sessionId) {
+      dbRemovePeer(sessionId, peerId).catch(console.error);
+    }
+  }, [sessionId]);
 
-  const handleTerminate = (id: string) => {
-    setPeers(prev => prev.filter(p => p.id !== id));
-  };
-
-  const handleShutdown = () => {
+  const handleShutdown = useCallback(async () => {
     setBroadcasting(false);
-    setTimeout(() => navigate('/'), 1500);
-  };
+    webrtcRef.current?.disconnectAll();
+    signalingRef.current?.disconnect();
+    if (sessionId) {
+      await endSession(sessionId).catch(console.error);
+    }
+    setTimeout(() => navigate('/'), 1000);
+  }, [sessionId, navigate]);
+
+  if (initializing) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center space-y-4">
+          <div className="h-12 w-12 rounded-full bg-primary signal-glow animate-pulse-glow mx-auto" />
+          <p className="text-sm font-mono">INITIALIZING_NODE...</p>
+          <p className="status-label">Creating session and setting up signaling</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center space-y-4">
+          <p className="text-sm font-mono text-destructive">INITIALIZATION_FAILED</p>
+          <p className="status-label">{error}</p>
+          <button onClick={() => navigate('/')} className="text-xs font-mono text-primary mechanical-press">
+            RETURN_HOME
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-background p-6 md:p-8">
@@ -97,8 +206,8 @@ const HostDashboard = () => {
 
           {peers.length === 0 && (
             <div className="bg-card border border-border p-12 text-center">
-              <div className="status-label mb-2">No peers connected</div>
-              <p className="text-sm text-muted-foreground">Share the session link to invite clients</p>
+              <div className="status-label mb-2">Waiting for peers...</div>
+              <p className="text-sm text-muted-foreground">Share the session link or QR code to invite clients</p>
             </div>
           )}
         </section>
@@ -134,7 +243,7 @@ const HostDashboard = () => {
             <div className="space-y-3">
               <div className="flex justify-between">
                 <span className="status-label">Session ID</span>
-                <span className="text-xs font-mono text-primary">{sessionId}</span>
+                <span className="text-xs font-mono text-primary">{sessionCode}</span>
               </div>
               <div className="flex justify-between">
                 <span className="status-label">Protocol</span>
@@ -143,6 +252,10 @@ const HostDashboard = () => {
               <div className="flex justify-between">
                 <span className="status-label">Encryption</span>
                 <span className="text-xs font-mono text-accent">AES-256-GCM</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="status-label">Signaling</span>
+                <span className="text-xs font-mono text-accent">Realtime Broadcast</span>
               </div>
               <div className="flex justify-between">
                 <span className="status-label">Max Peers</span>
