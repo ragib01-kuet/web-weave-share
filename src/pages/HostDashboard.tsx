@@ -21,6 +21,8 @@ interface PeerDisplay {
   totalData: number;
   status: 'active' | 'idle' | 'throttled';
   nodeType: 'relay' | 'client';
+  /** If this peer is connected through a relay, the relay's peerId */
+  connectedVia?: string;
 }
 
 const HostDashboard = () => {
@@ -36,6 +38,10 @@ const HostDashboard = () => {
 
   const signalingRef = useRef<SignalingService | null>(null);
   const webrtcRef = useRef<WebRTCManager | null>(null);
+  /** Set of peer IDs that have been promoted to relay */
+  const relayPeersRef = useRef<Set<string>>(new Set());
+  /** Map of client → relay assignment */
+  const relayAssignmentsRef = useRef<Map<string, string>>(new Map());
 
   const sessionLink = `${window.location.origin}/client/${sessionCode}`;
   const totalData = peers.reduce((s, p) => s + p.totalData, 0);
@@ -50,21 +56,22 @@ const HostDashboard = () => {
       uplink: p.uplink,
       totalData: p.totalData / (1024 * 1024),
       status: p.state === 'connected' ? 'active' : 'idle',
-      nodeType: 'client',
+      nodeType: relayPeersRef.current.has(p.peerId) ? 'relay' : 'client',
+      connectedVia: relayAssignmentsRef.current.get(p.peerId),
     }));
     setPeers(displayPeers);
   }, []);
 
   const handleProxyRequest = useCallback(async (peerId: string, requestId: string, url: string) => {
     try {
-      // PRIMARY: Use host's own browser fetch — traffic flows through HOST's internet
+      // PRIMARY: Use host's own browser fetch
       console.log(`[HOST] Fetching via host internet: ${url}`);
       const result = await hostFetchUrl(url);
       webrtcRef.current?.sendProxyResponse(peerId, requestId, result.body, result.status, result.contentType);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Proxy failed';
-      
-      // FALLBACK: If CORS blocks direct fetch, use edge function as relay
+
+      // FALLBACK: If CORS blocks direct fetch, use edge function
       if (errorMsg.startsWith('CORS_BLOCKED:')) {
         console.log(`[HOST] CORS blocked, falling back to edge proxy for: ${url}`);
         try {
@@ -77,9 +84,56 @@ const HostDashboard = () => {
           return;
         }
       }
-      
+
       webrtcRef.current?.sendProxyResponse(peerId, requestId, JSON.stringify({ error: errorMsg }), 500, 'application/json');
     }
+  }, []);
+
+  /**
+   * Promote a directly-connected peer to relay status.
+   * After promotion, new joiners may be routed through this relay.
+   */
+  const promotePeerToRelay = useCallback((peerId: string) => {
+    if (relayPeersRef.current.has(peerId)) return;
+    relayPeersRef.current.add(peerId);
+    console.log(`[HOST] Promoting ${peerId} to relay`);
+
+    // Tell the peer it's now a relay
+    signalingRef.current?.send({
+      type: 'relay-promote',
+      to: peerId,
+      payload: {},
+    });
+
+    // Update UI
+    const webrtc = webrtcRef.current;
+    if (webrtc) updatePeersFromWebRTC(webrtc.getPeers());
+  }, [updatePeersFromWebRTC]);
+
+  /**
+   * Get an available relay for a new joiner (round-robin)
+   */
+  const getAvailableRelay = useCallback((): string | null => {
+    const relays = Array.from(relayPeersRef.current);
+    if (relays.length === 0) return null;
+
+    // Find relay with fewest assigned clients
+    const assignmentCounts = new Map<string, number>();
+    for (const relay of relays) assignmentCounts.set(relay, 0);
+    for (const [, relay] of relayAssignmentsRef.current) {
+      assignmentCounts.set(relay, (assignmentCounts.get(relay) || 0) + 1);
+    }
+
+    // Pick relay with fewest clients (max 3 per relay)
+    let best: string | null = null;
+    let bestCount = Infinity;
+    for (const [relay, count] of assignmentCounts) {
+      if (count < 3 && count < bestCount) {
+        best = relay;
+        bestCount = count;
+      }
+    }
+    return best;
   }, []);
 
   useEffect(() => {
@@ -91,10 +145,35 @@ const HostDashboard = () => {
         setSessionId(session.id);
 
         const signaling = new SignalingService(sessionCode, hostId, (msg) => {
-          webrtcRef.current?.handleSignal(msg);
           if (msg.type === 'peer-joined') {
             addPeer(session.id, msg.from).catch(console.error);
+
+            // Check if we should route this peer through a relay
+            const relayId = getAvailableRelay();
+            if (relayId) {
+              console.log(`[HOST] Routing ${msg.from} through relay ${relayId}`);
+              relayAssignmentsRef.current.set(msg.from, relayId);
+
+              // Tell the new client to connect through the relay
+              signaling.send({
+                type: 'relay-assign',
+                to: msg.from,
+                payload: { relayId },
+              });
+
+              // Tell the relay to expect the new client
+              signaling.send({
+                type: 'relay-incoming',
+                to: relayId,
+                payload: { clientId: msg.from },
+              });
+
+              return; // Don't let WebRTC handle this directly
+            }
           }
+
+          // Pass all other signals to WebRTC
+          webrtcRef.current?.handleSignal(msg);
         });
         signalingRef.current = signaling;
 
@@ -113,7 +192,27 @@ const HostDashboard = () => {
     };
     init();
     return () => { cancelled = true; };
-  }, [hostId, sessionCode, updatePeersFromWebRTC, handleProxyRequest]);
+  }, [hostId, sessionCode, updatePeersFromWebRTC, handleProxyRequest, getAvailableRelay]);
+
+  // Auto-promote first connected peer to relay after 8 seconds of being connected
+  useEffect(() => {
+    if (!broadcasting) return;
+    const interval = setInterval(() => {
+      const webrtc = webrtcRef.current;
+      if (!webrtc) return;
+
+      const connectedPeers = Array.from(webrtc.getPeers().values())
+        .filter(p => p.state === 'connected' && p.direction === 'downstream');
+
+      for (const peer of connectedPeers) {
+        if (!relayPeersRef.current.has(peer.peerId) && Date.now() - peer.connectedAt > 8000) {
+          promotePeerToRelay(peer.peerId);
+          break; // Promote one at a time
+        }
+      }
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [broadcasting, promotePeerToRelay]);
 
   useEffect(() => {
     if (!broadcasting) return;
@@ -132,8 +231,21 @@ const HostDashboard = () => {
 
   const handleTerminate = useCallback((peerId: string) => {
     webrtcRef.current?.terminatePeer(peerId);
+    relayPeersRef.current.delete(peerId);
+    relayAssignmentsRef.current.delete(peerId);
     if (sessionId) dbRemovePeer(sessionId, peerId).catch(console.error);
   }, [sessionId]);
+
+  const handleToggleRelay = useCallback((peerId: string) => {
+    if (relayPeersRef.current.has(peerId)) {
+      relayPeersRef.current.delete(peerId);
+      console.log(`[HOST] Demoted ${peerId} from relay`);
+    } else {
+      promotePeerToRelay(peerId);
+    }
+    const webrtc = webrtcRef.current;
+    if (webrtc) updatePeersFromWebRTC(webrtc.getPeers());
+  }, [promotePeerToRelay, updatePeersFromWebRTC]);
 
   const handleShutdown = useCallback(async () => {
     setBroadcasting(false);
@@ -143,7 +255,7 @@ const HostDashboard = () => {
     setTimeout(() => navigate('/'), 1000);
   }, [sessionId, navigate]);
 
-  // Build topology data
+  // Build topology data — show relay chains
   const topoNodes: TopologyNode[] = [
     { id: hostId, label: 'You (Gateway)', type: 'gateway', status: 'active' },
     ...peers.map(p => ({
@@ -153,8 +265,10 @@ const HostDashboard = () => {
       status: p.status === 'active' ? 'active' as const : 'connecting' as const,
     })),
   ];
+
   const topoLinks: TopologyLink[] = peers.map(p => ({
-    source: hostId,
+    // If connected via relay, link to relay; otherwise link to host
+    source: p.connectedVia || hostId,
     target: p.id,
     bandwidth: p.downlink,
   }));
@@ -216,6 +330,7 @@ const HostDashboard = () => {
           <Metric label="Uptime" value={formatDuration(uptime * 1000)} />
           <Metric label="Data" value={formatBytes(totalData)} />
           <Metric label="Nodes" value={`${activePeers + 1}`} />
+          <Metric label="Relays" value={`${relayPeersRef.current.size}`} />
         </div>
       </header>
 
@@ -271,6 +386,7 @@ const HostDashboard = () => {
                 ['NAT', 'STUN + TURN'],
                 ['Encryption', 'AES-256-GCM'],
                 ['Max Nodes', '10'],
+                ['Mesh', relayPeersRef.current.size > 0 ? 'Multi-hop' : 'Direct'],
               ].map(([k, v]) => (
                 <div key={k} className="flex justify-between">
                   <span className="status-label">{k}</span>
@@ -297,7 +413,14 @@ const HostDashboard = () => {
                   <div className="flex items-center gap-4">
                     <div className={`h-2.5 w-2.5 rounded-full ${peer.status === 'active' ? 'bg-accent mesh-glow' : 'bg-muted-foreground'}`} />
                     <div>
-                      <div className="text-sm font-mono tracking-tight">{peer.ip}</div>
+                      <div className="text-sm font-mono tracking-tight flex items-center gap-2">
+                        {peer.ip}
+                        {peer.connectedVia && (
+                          <span className="text-[9px] text-muted-foreground">
+                            via {peer.connectedVia.slice(0, 8)}
+                          </span>
+                        )}
+                      </div>
                       <div className="flex items-center gap-2">
                         <NodeTypeBadge type={peer.nodeType} />
                         <span className="status-label">— {formatDuration(Date.now() - peer.connectedAt)}</span>
@@ -317,6 +440,18 @@ const HostDashboard = () => {
                       <div className="text-xs font-mono tabular">{peer.totalData.toFixed(1)} MB</div>
                       <div className="status-label">Total</div>
                     </div>
+                    {peer.status === 'active' && !peer.connectedVia && (
+                      <button
+                        onClick={() => handleToggleRelay(peer.id)}
+                        className={`text-[10px] font-mono mechanical-press transition-colors ${
+                          peer.nodeType === 'relay'
+                            ? 'text-[hsl(280,70%,60%)]'
+                            : 'text-muted-foreground hover:text-primary'
+                        }`}
+                      >
+                        {peer.nodeType === 'relay' ? '⬡ RELAY' : '⬡ Promote'}
+                      </button>
+                    )}
                     <button
                       onClick={() => handleTerminate(peer.id)}
                       className="opacity-0 group-hover:opacity-100 transition-opacity text-xs font-mono text-destructive mechanical-press"

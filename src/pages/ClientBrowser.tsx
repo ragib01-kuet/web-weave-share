@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { generateAnonymousId, getSession, addPeer, removePeer as dbRemovePeer, proxyFetch } from '@/lib/session-manager';
 import { SignalingService } from '@/lib/signaling';
-import { WebRTCManager, type PeerConnectionState } from '@/lib/webrtc';
+import { WebRTCManager, type PeerConnectionState, type NodeRole } from '@/lib/webrtc';
 import Metric from '@/components/Metric';
 import NodeTypeBadge from '@/components/NodeTypeBadge';
 
@@ -31,6 +31,8 @@ const ClientBrowser = () => {
   const [dataUsed, setDataUsed] = useState(0);
   const [useDirectProxy, setUseDirectProxy] = useState(false);
   const [connectionMode, setConnectionMode] = useState<'webrtc' | 'direct' | ''>('');
+  const [nodeRole, setNodeRole] = useState<NodeRole>('client');
+  const [downstreamCount, setDownstreamCount] = useState(0);
 
   const signalingRef = useRef<SignalingService | null>(null);
   const webrtcRef = useRef<WebRTCManager | null>(null);
@@ -44,6 +46,15 @@ const ClientBrowser = () => {
       setConnectionMode('webrtc');
       setState('connected');
     }
+
+    // Count downstream peers (for relay display)
+    const downstream = Array.from(peerMap.values()).filter(p => p.direction === 'downstream' && p.state === 'connected');
+    setDownstreamCount(downstream.length);
+  }, []);
+
+  const onRoleChange = useCallback((role: NodeRole) => {
+    setNodeRole(role);
+    console.log(`[CLIENT] Role changed to: ${role}`);
   }, []);
 
   useEffect(() => {
@@ -66,7 +77,7 @@ const ClientBrowser = () => {
         });
         signalingRef.current = signaling;
 
-        const webrtc = new WebRTCManager(signaling, clientId, false, onPeerUpdate);
+        const webrtc = new WebRTCManager(signaling, clientId, false, onPeerUpdate, undefined, onRoleChange);
         webrtcRef.current = webrtc;
 
         signaling.connect();
@@ -97,7 +108,7 @@ const ClientBrowser = () => {
     };
     init();
     return () => { cancelled = true; };
-  }, [sessionCode, clientId, onPeerUpdate]);
+  }, [sessionCode, clientId, onPeerUpdate, onRoleChange]);
 
   const handleNavigate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -160,13 +171,18 @@ const ClientBrowser = () => {
         <div className="flex items-center gap-3">
           <div className={`h-2.5 w-2.5 rounded-full ${statusColor}`} />
           <span className="text-sm font-display font-semibold tracking-tight">AetherGrid</span>
-          <NodeTypeBadge type="client" />
+          <NodeTypeBadge type={nodeRole === 'relay' ? 'relay' : 'client'} />
           <span className="status-label ml-1">Session: {sessionCode}</span>
           {connectionMode === 'direct' && state === 'connected' && (
             <span className="text-[10px] font-mono text-[hsl(var(--warning))] ml-2">DIRECT PROXY</span>
           )}
           {connectionMode === 'webrtc' && state === 'connected' && (
             <span className="text-[10px] font-mono text-accent ml-2">P2P TUNNEL</span>
+          )}
+          {nodeRole === 'relay' && (
+            <span className="text-[10px] font-mono text-[hsl(280,70%,60%)] ml-2">
+              RELAY ({downstreamCount} client{downstreamCount !== 1 ? 's' : ''})
+            </span>
           )}
         </div>
         <div className="flex items-center gap-4">
@@ -227,6 +243,16 @@ const ClientBrowser = () => {
       {/* Connected - browsing */}
       {state === 'connected' && (
         <>
+          {/* Relay banner */}
+          {nodeRole === 'relay' && (
+            <div className="bg-[hsl(280,70%,60%)]/10 border-b border-[hsl(280,70%,60%)]/20 px-4 py-2 flex items-center gap-3">
+              <div className="h-2 w-2 rounded-full bg-[hsl(280,70%,60%)] animate-pulse" />
+              <span className="text-[11px] font-mono text-[hsl(280,70%,60%)]">
+                RELAY MODE ACTIVE — Forwarding traffic for {downstreamCount} peer{downstreamCount !== 1 ? 's' : ''}
+              </span>
+            </div>
+          )}
+
           <form onSubmit={handleNavigate} className="border-b border-border px-4 py-2.5 flex gap-2">
             <div className="flex-1 flex items-center bg-card border border-border rounded-md px-3">
               <span className="text-[10px] font-mono text-accent mr-2">🔒</span>
