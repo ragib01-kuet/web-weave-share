@@ -1,10 +1,9 @@
 import type { SignalingService, SignalMessage } from './signaling';
 import { supabase } from '@/integrations/supabase/client';
 
-// Max size for a single DataChannel message (16KB to be safe across browsers)
+// Max size for a single DataChannel message (16KB safe across browsers)
 const CHUNK_SIZE = 16 * 1024;
 
-// Fetch ICE servers from edge function (includes TURN)
 async function getIceServers(): Promise<RTCIceServer[]> {
   try {
     const { data, error } = await supabase.functions.invoke('get-ice-servers');
@@ -26,6 +25,8 @@ function getFallbackIceServers(): RTCIceServer[] {
   ];
 }
 
+export type NodeRole = 'gateway' | 'relay' | 'client';
+
 export interface PeerConnectionState {
   peerId: string;
   connection: RTCPeerConnection;
@@ -35,10 +36,13 @@ export interface PeerConnectionState {
   uplink: number;
   totalData: number;
   connectedAt: number;
+  /** Whether this peer is an upstream (host/relay) or downstream (client through us) */
+  direction: 'upstream' | 'downstream';
 }
 
 type OnPeerUpdate = (peers: Map<string, PeerConnectionState>) => void;
 type OnProxyRequest = (peerId: string, requestId: string, url: string) => void;
+type OnRoleChange = (role: NodeRole) => void;
 
 export class WebRTCManager {
   private peers = new Map<string, PeerConnectionState>();
@@ -47,26 +51,34 @@ export class WebRTCManager {
   private isHost: boolean;
   private onPeerUpdate: OnPeerUpdate;
   private onProxyRequest?: OnProxyRequest;
+  private onRoleChange?: OnRoleChange;
   private bandwidthTrackers = new Map<string, { lastTime: number; bytes: number }>();
   private iceServers: RTCIceServer[] = [];
   private iceServersReady = false;
   private pendingSignals: SignalMessage[] = [];
   private responseHandlers = new Map<string, (data: any) => void>();
-  // Buffer for reassembling chunked messages
   private chunkBuffers = new Map<string, { chunks: string[]; total: number }>();
+
+  // Relay state
+  private isRelay = false;
+  private upstreamPeerId: string | null = null;
+  /** Maps relay-generated requestId → { downstreamPeerId, originalRequestId } */
+  private relayRequestMap = new Map<string, { downstreamPeerId: string; originalRequestId: string }>();
 
   constructor(
     signaling: SignalingService,
     localId: string,
     isHost: boolean,
     onPeerUpdate: OnPeerUpdate,
-    onProxyRequest?: OnProxyRequest
+    onProxyRequest?: OnProxyRequest,
+    onRoleChange?: OnRoleChange
   ) {
     this.signaling = signaling;
     this.localId = localId;
     this.isHost = isHost;
     this.onPeerUpdate = onPeerUpdate;
     this.onProxyRequest = onProxyRequest;
+    this.onRoleChange = onRoleChange;
     this.initIceServers();
   }
 
@@ -91,22 +103,52 @@ export class WebRTCManager {
       case 'peer-joined':
         if (this.isHost) {
           console.log(`[HOST] Peer joined: ${msg.from}`);
-          this.createOffer(msg.from);
+          this.createOffer(msg.from, 'downstream');
         }
         break;
+
       case 'offer':
-        console.log(`[CLIENT] Received offer from: ${msg.from}`);
+        console.log(`[${this.isHost ? 'HOST' : 'CLIENT'}] Received offer from: ${msg.from}`);
         this.handleOffer(msg.from, msg.payload);
         break;
+
       case 'answer':
-        console.log(`[HOST] Received answer from: ${msg.from}`);
+        console.log(`[${this.isHost ? 'HOST' : 'RELAY'}] Received answer from: ${msg.from}`);
         this.handleAnswer(msg.from, msg.payload);
         break;
+
       case 'ice-candidate':
         this.handleIceCandidate(msg.from, msg.payload);
         break;
+
       case 'peer-left':
         this.removePeer(msg.from);
+        break;
+
+      // --- Relay signals ---
+      case 'relay-promote':
+        // Host is promoting us to relay
+        console.log(`[CLIENT→RELAY] Promoted to relay by host`);
+        this.isRelay = true;
+        this.upstreamPeerId = msg.from; // The host is our upstream
+        this.onRoleChange?.('relay');
+        break;
+
+      case 'relay-incoming':
+        // Host tells us (relay) to expect a connection from a new client
+        if (this.isRelay) {
+          const clientId = msg.payload.clientId;
+          console.log(`[RELAY] Incoming client: ${clientId}, creating offer`);
+          this.createOffer(clientId, 'downstream');
+        }
+        break;
+
+      case 'relay-assign':
+        // Host tells us (new client) to connect through a relay
+        // We DON'T announce peer-joined; just wait for the relay's offer
+        console.log(`[CLIENT] Assigned to relay: ${msg.payload.relayId}`);
+        this.upstreamPeerId = msg.payload.relayId;
+        // The relay will send us an offer via relay-incoming
         break;
     }
   }
@@ -118,6 +160,16 @@ export class WebRTCManager {
   announceJoin() {
     console.log(`[CLIENT] Announcing join`);
     this.signaling.send({ type: 'peer-joined', payload: {} });
+  }
+
+  getRole(): NodeRole {
+    if (this.isHost) return 'gateway';
+    if (this.isRelay) return 'relay';
+    return 'client';
+  }
+
+  getIsRelay(): boolean {
+    return this.isRelay;
   }
 
   private createPeerConnection(peerId: string): RTCPeerConnection {
@@ -158,13 +210,10 @@ export class WebRTCManager {
     return pc;
   }
 
-  private async createOffer(peerId: string) {
+  private async createOffer(peerId: string, direction: 'upstream' | 'downstream') {
     const pc = this.createPeerConnection(peerId);
 
-    // Use ordered + reliable data channel for proxy traffic
-    const dc = pc.createDataChannel('aether-proxy', {
-      ordered: true,
-    });
+    const dc = pc.createDataChannel('aether-proxy', { ordered: true });
     this.setupDataChannel(dc, peerId);
 
     const peerState: PeerConnectionState = {
@@ -176,6 +225,7 @@ export class WebRTCManager {
       uplink: 0,
       totalData: 0,
       connectedAt: Date.now(),
+      direction,
     };
     this.peers.set(peerId, peerState);
     this.notifyUpdate();
@@ -190,7 +240,7 @@ export class WebRTCManager {
         payload: pc.localDescription?.toJSON(),
       });
     } catch (e) {
-      console.error(`[HOST] Failed to create offer for ${peerId}:`, e);
+      console.error(`Failed to create offer for ${peerId}:`, e);
     }
   }
 
@@ -198,11 +248,15 @@ export class WebRTCManager {
     const pc = this.createPeerConnection(peerId);
 
     pc.ondatachannel = (event) => {
-      console.log(`[CLIENT] Data channel received from ${peerId}`);
+      console.log(`Data channel received from ${peerId}`);
       this.setupDataChannel(event.channel, peerId);
       const state = this.peers.get(peerId);
       if (state) state.dataChannel = event.channel;
     };
+
+    // Determine direction: if offer comes from a known upstream or host, it's upstream
+    const direction: 'upstream' | 'downstream' =
+      (this.upstreamPeerId === peerId || (!this.isHost && !this.isRelay)) ? 'upstream' : 'downstream';
 
     const peerState: PeerConnectionState = {
       peerId,
@@ -213,6 +267,7 @@ export class WebRTCManager {
       uplink: 0,
       totalData: 0,
       connectedAt: Date.now(),
+      direction,
     };
     this.peers.set(peerId, peerState);
     this.notifyUpdate();
@@ -228,7 +283,7 @@ export class WebRTCManager {
         payload: pc.localDescription?.toJSON(),
       });
     } catch (e) {
-      console.error(`[CLIENT] Failed to handle offer from ${peerId}:`, e);
+      console.error(`Failed to handle offer from ${peerId}:`, e);
     }
   }
 
@@ -238,7 +293,7 @@ export class WebRTCManager {
     try {
       await state.connection.setRemoteDescription(new RTCSessionDescription(answer));
     } catch (e) {
-      console.error(`[HOST] Failed to set answer from ${peerId}:`, e);
+      console.error(`Failed to set answer from ${peerId}:`, e);
     }
   }
 
@@ -279,18 +334,7 @@ export class WebRTCManager {
           return;
         }
 
-        if (message.type === 'FETCH_REQUEST' && this.isHost && this.onProxyRequest) {
-          console.log(`[HOST] Proxy request from ${peerId}: ${message.url}`);
-          this.onProxyRequest(peerId, message.id, message.url);
-        }
-
-        if (message.type === 'FETCH_RESPONSE' && !this.isHost) {
-          const handler = this.responseHandlers.get(message.id);
-          if (handler) {
-            handler(message);
-            this.responseHandlers.delete(message.id);
-          }
-        }
+        this.handleDataMessage(peerId, message);
       } catch (e) {
         console.warn('Failed to parse data channel message:', e);
       }
@@ -309,7 +353,100 @@ export class WebRTCManager {
   }
 
   /**
-   * Handle incoming chunk — reassemble into full message when all chunks received
+   * Central message handler — handles FETCH_REQUEST/RESPONSE with relay forwarding
+   */
+  private handleDataMessage(fromPeerId: string, message: any) {
+    if (message.type === 'FETCH_REQUEST') {
+      if (this.isHost && this.onProxyRequest) {
+        // Gateway: fetch the URL using host's internet
+        console.log(`[HOST] Proxy request from ${fromPeerId}: ${message.url}`);
+        this.onProxyRequest(fromPeerId, message.id, message.url);
+      } else if (this.isRelay) {
+        // Relay: forward upstream to host/upstream relay
+        this.forwardRequestUpstream(fromPeerId, message);
+      }
+    }
+
+    if (message.type === 'FETCH_RESPONSE') {
+      if (this.isRelay) {
+        // Check if this response is for a relayed request
+        const relayInfo = this.relayRequestMap.get(message.id);
+        if (relayInfo) {
+          // Forward response back to the downstream client
+          this.relayRequestMap.delete(message.id);
+          this.sendProxyResponse(
+            relayInfo.downstreamPeerId,
+            relayInfo.originalRequestId,
+            message.body,
+            message.status,
+            message.contentType
+          );
+          return;
+        }
+      }
+
+      // Normal client: resolve the pending request
+      const handler = this.responseHandlers.get(message.id);
+      if (handler) {
+        handler(message);
+        this.responseHandlers.delete(message.id);
+      }
+    }
+  }
+
+  /**
+   * Relay: forward a FETCH_REQUEST upstream
+   */
+  private forwardRequestUpstream(downstreamPeerId: string, originalMessage: any) {
+    // Find upstream peer (host or upstream relay)
+    const upstream = this.getUpstreamPeer();
+    if (!upstream?.dataChannel || upstream.dataChannel.readyState !== 'open') {
+      // No upstream — send error back
+      this.sendProxyResponse(downstreamPeerId, originalMessage.id,
+        JSON.stringify({ error: 'No upstream connection available' }), 502, 'application/json');
+      return;
+    }
+
+    // Generate new requestId for upstream, map it back
+    const upstreamRequestId = Math.random().toString(36).slice(2);
+    this.relayRequestMap.set(upstreamRequestId, {
+      downstreamPeerId,
+      originalRequestId: originalMessage.id,
+    });
+
+    const forwardMsg = JSON.stringify({
+      type: 'FETCH_REQUEST',
+      id: upstreamRequestId,
+      url: originalMessage.url,
+    });
+
+    console.log(`[RELAY] Forwarding request upstream: ${originalMessage.url}`);
+    try {
+      this.sendChunked(upstream.dataChannel, upstream.peerId, forwardMsg);
+    } catch (e) {
+      this.relayRequestMap.delete(upstreamRequestId);
+      this.sendProxyResponse(downstreamPeerId, originalMessage.id,
+        JSON.stringify({ error: 'Failed to forward upstream' }), 502, 'application/json');
+    }
+  }
+
+  /**
+   * Get the upstream peer (host or upstream relay)
+   */
+  private getUpstreamPeer(): PeerConnectionState | undefined {
+    // If we know our upstream peer ID, use that
+    if (this.upstreamPeerId) {
+      const upstream = this.peers.get(this.upstreamPeerId);
+      if (upstream?.state === 'connected') return upstream;
+    }
+    // Otherwise find any upstream peer
+    return Array.from(this.peers.values()).find(
+      p => p.direction === 'upstream' && p.state === 'connected' && p.dataChannel?.readyState === 'open'
+    );
+  }
+
+  /**
+   * Handle incoming chunk — reassemble into full message
    */
   private handleChunk(peerId: string, chunk: { chunkId: string; index: number; total: number; data: string }) {
     const key = chunk.chunkId;
@@ -320,7 +457,6 @@ export class WebRTCManager {
     const buffer = this.chunkBuffers.get(key)!;
     buffer.chunks[chunk.index] = chunk.data;
 
-    // Check if all chunks received
     const received = buffer.chunks.filter(c => c !== undefined).length;
     if (received === buffer.total) {
       const fullData = buffer.chunks.join('');
@@ -328,17 +464,7 @@ export class WebRTCManager {
 
       try {
         const message = JSON.parse(fullData);
-        // Re-dispatch the reassembled message
-        if (message.type === 'FETCH_RESPONSE' && !this.isHost) {
-          const handler = this.responseHandlers.get(message.id);
-          if (handler) {
-            handler(message);
-            this.responseHandlers.delete(message.id);
-          }
-        }
-        if (message.type === 'FETCH_REQUEST' && this.isHost && this.onProxyRequest) {
-          this.onProxyRequest(peerId, message.id, message.url);
-        }
+        this.handleDataMessage(peerId, message);
       } catch (e) {
         console.error('Failed to parse reassembled chunked message:', e);
       }
@@ -355,7 +481,6 @@ export class WebRTCManager {
       return;
     }
 
-    // Split into chunks
     const chunkId = Math.random().toString(36).slice(2);
     const totalChunks = Math.ceil(message.length / CHUNK_SIZE);
 
@@ -377,18 +502,20 @@ export class WebRTCManager {
     return new Promise((resolve, reject) => {
       const requestId = Math.random().toString(36).slice(2);
 
-      const hostPeer = Array.from(this.peers.values()).find(
+      // Find upstream peer (host or relay)
+      const upstream = this.getUpstreamPeer() || Array.from(this.peers.values()).find(
         p => p.state === 'connected' && p.dataChannel?.readyState === 'open'
       );
-      if (!hostPeer || !hostPeer.dataChannel) {
-        reject(new Error('No connected host'));
+
+      if (!upstream || !upstream.dataChannel) {
+        reject(new Error('No connected upstream peer'));
         return;
       }
 
       const message = JSON.stringify({ type: 'FETCH_REQUEST', id: requestId, url });
 
       try {
-        this.sendChunked(hostPeer.dataChannel, hostPeer.peerId, message);
+        this.sendChunked(upstream.dataChannel, upstream.peerId, message);
       } catch (e) {
         reject(new Error('Failed to send via data channel'));
         return;
@@ -406,13 +533,10 @@ export class WebRTCManager {
     });
   }
 
-  /**
-   * Send proxy response back to client — uses chunking for large payloads
-   */
   sendProxyResponse(peerId: string, requestId: string, body: string, status: number, contentType: string) {
     const state = this.peers.get(peerId);
     if (!state?.dataChannel || state.dataChannel.readyState !== 'open') {
-      console.warn(`[HOST] Cannot send response to ${peerId} - channel not open`);
+      console.warn(`Cannot send response to ${peerId} - channel not open`);
       return;
     }
 
@@ -421,8 +545,15 @@ export class WebRTCManager {
     try {
       this.sendChunked(state.dataChannel, peerId, message);
     } catch (e) {
-      console.error(`[HOST] Failed to send proxy response to ${peerId}:`, e);
+      console.error(`Failed to send proxy response to ${peerId}:`, e);
     }
+  }
+
+  /**
+   * Get list of downstream (client) peers for relay/host
+   */
+  getDownstreamPeers(): PeerConnectionState[] {
+    return Array.from(this.peers.values()).filter(p => p.direction === 'downstream');
   }
 
   removePeer(peerId: string) {

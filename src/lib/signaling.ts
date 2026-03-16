@@ -1,7 +1,14 @@
 import { supabase } from '@/integrations/supabase/client';
 import type { RealtimeChannel } from '@supabase/supabase-js';
 
-export type SignalType = 'offer' | 'answer' | 'ice-candidate' | 'peer-joined' | 'peer-left' | 'proxy-request' | 'proxy-response';
+export type SignalType =
+  | 'offer' | 'answer' | 'ice-candidate'
+  | 'peer-joined' | 'peer-left'
+  | 'proxy-request' | 'proxy-response'
+  // Relay signals
+  | 'relay-assign'    // Host → new client: "connect through this relay instead"
+  | 'relay-incoming'  // Host → relay: "expect a connection from this client"
+  | 'relay-promote';  // Host → peer: "you are now a relay node"
 
 export interface SignalMessage {
   type: SignalType;
