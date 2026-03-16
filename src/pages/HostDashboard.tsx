@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import { formatDuration, formatBytes } from '@/lib/mock-data';
 import { generateSessionCode, generateAnonymousId, createSession, endSession, addPeer, removePeer as dbRemovePeer, proxyFetch } from '@/lib/session-manager';
+import { hostFetchUrl } from '@/lib/host-proxy';
 import { SignalingService } from '@/lib/signaling';
 import { WebRTCManager, type PeerConnectionState } from '@/lib/webrtc';
 import Metric from '@/components/Metric';
