@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import { formatDuration, formatBytes } from '@/lib/mock-data';
 import { generateSessionCode, generateAnonymousId, createSession, endSession, addPeer, removePeer as dbRemovePeer, proxyFetch } from '@/lib/session-manager';
+import { hostFetchUrl } from '@/lib/host-proxy';
 import { SignalingService } from '@/lib/signaling';
 import { WebRTCManager, type PeerConnectionState } from '@/lib/webrtc';
 import Metric from '@/components/Metric';
@@ -56,10 +57,27 @@ const HostDashboard = () => {
 
   const handleProxyRequest = useCallback(async (peerId: string, requestId: string, url: string) => {
     try {
-      const result = await proxyFetch(url);
+      // PRIMARY: Use host's own browser fetch — traffic flows through HOST's internet
+      console.log(`[HOST] Fetching via host internet: ${url}`);
+      const result = await hostFetchUrl(url);
       webrtcRef.current?.sendProxyResponse(peerId, requestId, result.body, result.status, result.contentType);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Proxy failed';
+      
+      // FALLBACK: If CORS blocks direct fetch, use edge function as relay
+      if (errorMsg.startsWith('CORS_BLOCKED:')) {
+        console.log(`[HOST] CORS blocked, falling back to edge proxy for: ${url}`);
+        try {
+          const fallback = await proxyFetch(url);
+          webrtcRef.current?.sendProxyResponse(peerId, requestId, fallback.body, fallback.status, fallback.contentType);
+          return;
+        } catch (fallbackErr) {
+          const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : 'Fallback proxy failed';
+          webrtcRef.current?.sendProxyResponse(peerId, requestId, JSON.stringify({ error: fbMsg }), 500, 'application/json');
+          return;
+        }
+      }
+      
       webrtcRef.current?.sendProxyResponse(peerId, requestId, JSON.stringify({ error: errorMsg }), 500, 'application/json');
     }
   }, []);

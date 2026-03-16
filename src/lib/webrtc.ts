@@ -1,6 +1,9 @@
 import type { SignalingService, SignalMessage } from './signaling';
 import { supabase } from '@/integrations/supabase/client';
 
+// Max size for a single DataChannel message (16KB to be safe across browsers)
+const CHUNK_SIZE = 16 * 1024;
+
 // Fetch ICE servers from edge function (includes TURN)
 async function getIceServers(): Promise<RTCIceServer[]> {
   try {
@@ -48,6 +51,9 @@ export class WebRTCManager {
   private iceServers: RTCIceServer[] = [];
   private iceServersReady = false;
   private pendingSignals: SignalMessage[] = [];
+  private responseHandlers = new Map<string, (data: any) => void>();
+  // Buffer for reassembling chunked messages
+  private chunkBuffers = new Map<string, { chunks: string[]; total: number }>();
 
   constructor(
     signaling: SignalingService,
@@ -61,8 +67,6 @@ export class WebRTCManager {
     this.isHost = isHost;
     this.onPeerUpdate = onPeerUpdate;
     this.onProxyRequest = onProxyRequest;
-
-    // Fetch ICE servers immediately
     this.initIceServers();
   }
 
@@ -71,7 +75,6 @@ export class WebRTCManager {
     this.iceServersReady = true;
     console.log(`[WebRTC] ICE servers loaded: ${this.iceServers.length} servers (${this.iceServers.filter(s => typeof s.urls === 'string' ? s.urls.startsWith('turn') : false).length} TURN)`);
 
-    // Process any signals that arrived before ICE servers were ready
     for (const msg of this.pendingSignals) {
       this.handleSignal(msg);
     }
@@ -118,7 +121,7 @@ export class WebRTCManager {
   }
 
   private createPeerConnection(peerId: string): RTCPeerConnection {
-    const pc = new RTCPeerConnection({ 
+    const pc = new RTCPeerConnection({
       iceServers: this.iceServers,
       iceCandidatePoolSize: 10,
     });
@@ -146,7 +149,7 @@ export class WebRTCManager {
         state.state = 'connected';
         state.connectedAt = Date.now();
         this.startBandwidthTracking(peerId);
-      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      } else if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
         state.state = 'disconnected';
       }
       this.notifyUpdate();
@@ -158,7 +161,10 @@ export class WebRTCManager {
   private async createOffer(peerId: string) {
     const pc = this.createPeerConnection(peerId);
 
-    const dc = pc.createDataChannel('aether-proxy', { ordered: true });
+    // Use ordered + reliable data channel for proxy traffic
+    const dc = pc.createDataChannel('aether-proxy', {
+      ordered: true,
+    });
     this.setupDataChannel(dc, peerId);
 
     const peerState: PeerConnectionState = {
@@ -248,7 +254,7 @@ export class WebRTCManager {
 
   private setupDataChannel(dc: RTCDataChannel, peerId: string) {
     dc.binaryType = 'arraybuffer';
-    
+
     dc.onopen = () => {
       console.log(`[WebRTC] Data channel OPEN with ${peerId}`);
       const state = this.peers.get(peerId);
@@ -266,6 +272,12 @@ export class WebRTCManager {
 
       try {
         const message = JSON.parse(event.data);
+
+        // Handle chunked messages
+        if (message.type === 'CHUNK') {
+          this.handleChunk(peerId, message);
+          return;
+        }
 
         if (message.type === 'FETCH_REQUEST' && this.isHost && this.onProxyRequest) {
           console.log(`[HOST] Proxy request from ${peerId}: ${message.url}`);
@@ -296,7 +308,70 @@ export class WebRTCManager {
     };
   }
 
-  private responseHandlers = new Map<string, (data: any) => void>();
+  /**
+   * Handle incoming chunk — reassemble into full message when all chunks received
+   */
+  private handleChunk(peerId: string, chunk: { chunkId: string; index: number; total: number; data: string }) {
+    const key = chunk.chunkId;
+    if (!this.chunkBuffers.has(key)) {
+      this.chunkBuffers.set(key, { chunks: new Array(chunk.total), total: chunk.total });
+    }
+
+    const buffer = this.chunkBuffers.get(key)!;
+    buffer.chunks[chunk.index] = chunk.data;
+
+    // Check if all chunks received
+    const received = buffer.chunks.filter(c => c !== undefined).length;
+    if (received === buffer.total) {
+      const fullData = buffer.chunks.join('');
+      this.chunkBuffers.delete(key);
+
+      try {
+        const message = JSON.parse(fullData);
+        // Re-dispatch the reassembled message
+        if (message.type === 'FETCH_RESPONSE' && !this.isHost) {
+          const handler = this.responseHandlers.get(message.id);
+          if (handler) {
+            handler(message);
+            this.responseHandlers.delete(message.id);
+          }
+        }
+        if (message.type === 'FETCH_REQUEST' && this.isHost && this.onProxyRequest) {
+          this.onProxyRequest(peerId, message.id, message.url);
+        }
+      } catch (e) {
+        console.error('Failed to parse reassembled chunked message:', e);
+      }
+    }
+  }
+
+  /**
+   * Send a message over DataChannel, chunking if necessary
+   */
+  private sendChunked(dc: RTCDataChannel, peerId: string, message: string) {
+    if (message.length <= CHUNK_SIZE) {
+      this.trackBandwidth(peerId, message.length, 'up');
+      dc.send(message);
+      return;
+    }
+
+    // Split into chunks
+    const chunkId = Math.random().toString(36).slice(2);
+    const totalChunks = Math.ceil(message.length / CHUNK_SIZE);
+
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkData = message.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+      const chunkMsg = JSON.stringify({
+        type: 'CHUNK',
+        chunkId,
+        index: i,
+        total: totalChunks,
+        data: chunkData,
+      });
+      this.trackBandwidth(peerId, chunkMsg.length, 'up');
+      dc.send(chunkMsg);
+    }
+  }
 
   sendProxyRequest(url: string): Promise<{ body: string; status: number; contentType: string }> {
     return new Promise((resolve, reject) => {
@@ -311,10 +386,9 @@ export class WebRTCManager {
       }
 
       const message = JSON.stringify({ type: 'FETCH_REQUEST', id: requestId, url });
-      this.trackBandwidth(hostPeer.peerId, message.length, 'up');
-      
+
       try {
-        hostPeer.dataChannel.send(message);
+        this.sendChunked(hostPeer.dataChannel, hostPeer.peerId, message);
       } catch (e) {
         reject(new Error('Failed to send via data channel'));
         return;
@@ -332,6 +406,9 @@ export class WebRTCManager {
     });
   }
 
+  /**
+   * Send proxy response back to client — uses chunking for large payloads
+   */
   sendProxyResponse(peerId: string, requestId: string, body: string, status: number, contentType: string) {
     const state = this.peers.get(peerId);
     if (!state?.dataChannel || state.dataChannel.readyState !== 'open') {
@@ -339,12 +416,10 @@ export class WebRTCManager {
       return;
     }
 
-    // Split large responses into chunks if needed (data channel has ~256KB limit)
     const message = JSON.stringify({ type: 'FETCH_RESPONSE', id: requestId, body, status, contentType });
-    
+
     try {
-      this.trackBandwidth(peerId, message.length, 'up');
-      state.dataChannel.send(message);
+      this.sendChunked(state.dataChannel, peerId, message);
     } catch (e) {
       console.error(`[HOST] Failed to send proxy response to ${peerId}:`, e);
     }
@@ -391,7 +466,7 @@ export class WebRTCManager {
       if (tracker) {
         const elapsed = (Date.now() - tracker.lastTime) / 1000;
         if (elapsed > 0.5) {
-          state.downlink = (tracker.bytes / elapsed) * 8 / 1_000_000; // Mb/s
+          state.downlink = (tracker.bytes / elapsed) * 8 / 1_000_000;
           tracker.lastTime = Date.now();
           tracker.bytes = bytes;
         } else {
